@@ -1,0 +1,244 @@
+// 100BID — Prisma schema
+// Money is always stored as an integer number of cents (1 USD = 100 cents).
+// Never use Float/Decimal-as-JS-number arithmetic for money in application code.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum BidStatus {
+  PENDING // payment created, awaiting confirmation
+  PAID // payment confirmed, ownership transferred
+  FAILED // payment failed
+  EXPIRED // payment window expired without confirmation
+  CANCELLED // superseded / cancelled before payment
+}
+
+enum PaymentStatus {
+  CREATED
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+}
+
+enum AdvertisementStatus {
+  PENDING // metadata fetched, not yet live
+  ACTIVE // currently live on a spot
+  FLAGGED // reported, under review
+  REJECTED // removed by moderation
+}
+
+enum ReportStatus {
+  OPEN
+  REVIEWED
+  DISMISSED
+  ACTIONED
+}
+
+// ---------------------------------------------------------------------------
+// Models
+// ---------------------------------------------------------------------------
+
+/// An advertiser is identified only by email — there is no account/password.
+model Advertiser {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  advertisements  Advertisement[]
+  bids            Bid[]
+  ownershipRows   OwnershipHistory[]
+  managementToken ManagementToken[]
+  slotsOwned      Slot[]             @relation("SlotCurrentAdvertiser")
+  reportsFiled    Report[]           @relation("ReportFiledBy")
+
+  @@index([email])
+}
+
+/// One of the 100 fixed advertising spots.
+model Slot {
+  id     String @id @default(uuid())
+  number Int    @unique
+
+  currentBidAmount    Int // cents; 0 while empty
+  currentAdvertiserId String?
+  currentAdvertiser   Advertiser? @relation("SlotCurrentAdvertiser", fields: [currentAdvertiserId], references: [id])
+  currentAdId         String?
+  currentAd           Advertisement? @relation("SlotCurrentAd", fields: [currentAdId], references: [id])
+
+  ownershipStartedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  bids    Bid[]
+  history OwnershipHistory[]
+
+  @@index([number])
+  @@index([currentAdvertiserId])
+}
+
+/// A brand's advertisement content, derived entirely from fetched website metadata.
+model Advertisement {
+  id String @id @default(uuid())
+
+  advertiserId String
+  advertiser   Advertiser @relation(fields: [advertiserId], references: [id])
+
+  websiteUrl   String
+  canonicalUrl String?
+  brandName    String
+  description  String?
+  imageUrl     String?
+  faviconUrl   String?
+
+  status AdvertisementStatus @default(PENDING)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  bids            Bid[]
+  slotsCurrent    Slot[]             @relation("SlotCurrentAd")
+  ownershipRows   OwnershipHistory[]
+  reports         Report[]
+
+  @@index([advertiserId])
+  @@index([status])
+}
+
+/// A single bid attempt on a slot. Only a PAID bid ever changes slot ownership.
+model Bid {
+  id String @id @default(uuid())
+
+  slotId String
+  slot   Slot   @relation(fields: [slotId], references: [id])
+
+  advertiserId String
+  advertiser   Advertiser @relation(fields: [advertiserId], references: [id])
+
+  advertisementId String
+  advertisement   Advertisement @relation(fields: [advertisementId], references: [id])
+
+  amount Int // cents, must be > slot.currentBidAmount at prepare time
+
+  status BidStatus @default(PENDING)
+
+  payment Payment?
+
+  expiresAt DateTime // unpaid bids are invalidated after this
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  ownershipRow OwnershipHistory?
+
+  @@index([slotId])
+  @@index([status])
+  @@index([advertiserId])
+}
+
+/// Permanent record of every advertiser that has ever held a slot.
+model OwnershipHistory {
+  id String @id @default(uuid())
+
+  slotId String
+  slot   Slot   @relation(fields: [slotId], references: [id])
+
+  advertiserId String
+  advertiser   Advertiser @relation(fields: [advertiserId], references: [id])
+
+  advertisementId String
+  advertisement   Advertisement @relation(fields: [advertisementId], references: [id])
+
+  bidId String @unique
+  bid   Bid    @relation(fields: [bidId], references: [id])
+
+  amount Int // cents, the winning bid amount for this ownership period
+
+  startedAt DateTime
+  endedAt   DateTime? // null while this is the current owner's row
+
+  @@index([slotId])
+  @@index([advertiserId])
+}
+
+/// A payment order/attempt for a bid, provider-agnostic.
+model Payment {
+  id String @id @default(uuid())
+
+  bidId String @unique
+  bid   Bid    @relation(fields: [bidId], references: [id])
+
+  provider          String // "mock" | "razorpay" | "cashfree" ...
+  providerOrderId   String? @unique
+  providerPaymentId String? @unique
+
+  amount   Int // cents
+  currency String @default("USD")
+
+  status PaymentStatus @default(CREATED)
+
+  metadata Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([providerOrderId])
+  @@index([providerPaymentId])
+}
+
+/// Secure, passwordless "login" for a single advertiser to manage their spot.
+/// The raw token is emailed to the advertiser and is NEVER stored — only its hash.
+model ManagementToken {
+  id String @id @default(uuid())
+
+  advertiserId String
+  advertiser   Advertiser @relation(fields: [advertiserId], references: [id])
+
+  slotId String
+
+  tokenHash String @unique
+
+  expiresAt  DateTime
+  createdAt  DateTime  @default(now())
+  lastUsedAt DateTime?
+  revokedAt  DateTime?
+
+  @@index([advertiserId])
+  @@index([slotId])
+  @@index([tokenHash])
+}
+
+/// User-submitted report against an advertisement, for moderation.
+model Report {
+  id String @id @default(uuid())
+
+  advertisementId String
+  advertisement   Advertisement @relation(fields: [advertisementId], references: [id])
+
+  reporterAdvertiserId String?
+  reporterAdvertiser   Advertiser? @relation("ReportFiledBy", fields: [reporterAdvertiserId], references: [id])
+
+  reporterEmail String?
+  reason        String
+  details       String?
+
+  status ReportStatus @default(OPEN)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([advertisementId])
+  @@index([status])
+}
